@@ -1,0 +1,4 @@
+aiogram==3.13.1
+aiosqlite
+python-dotenv==1.0.1
+Pillow>=10.0.0
