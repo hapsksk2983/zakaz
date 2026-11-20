@@ -1,0 +1,748 @@
+import asyncio
+import html
+import logging
+import os
+from contextlib import asynccontextmanager
+from pathlib import Path
+
+import aiosqlite
+from aiogram import Bot, Dispatcher, Router, F
+from aiogram.client.default import DefaultBotProperties
+from aiogram.enums import ParseMode
+from aiogram.filters import Command, CommandStart
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
+from aiogram.fsm.storage.memory import MemoryStorage
+from aiogram.types import (
+    Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton,
+    ReplyKeyboardRemove, InputMediaPhoto,
+)
+from dotenv import load_dotenv
+
+# CORSET — единый файл zakaz.py
+# Установка: pip install aiogram aiosqlite python-dotenv
+# Переменные окружения: BOT_TOKEN, ADMIN_ID, DB_PATH, FEEDBACK_URL
+
+load_dotenv()
+BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
+ADMIN_ID = int(os.getenv("ADMIN_ID", "0") or 0)
+DB_PATH = os.getenv("DB_PATH", "data/corset.db")
+FEEDBACK_URL = os.getenv("FEEDBACK_URL", "").strip()
+logging.basicConfig(level=logging.INFO)
+log = logging.getLogger("corset")
+router = Router()
+
+MEASUREMENTS = [
+    ("height", "Рост", "Укажите рост в сантиметрах. Например: 168"),
+    ("bust", "Обхват груди", "Измерьте обхват груди по наиболее выступающим точкам. См."),
+    ("underbust", "Обхват под грудью", "Измерьте обхват непосредственно под грудью. См."),
+    ("waist", "Обхват талии", "Измерьте наиболее узкую часть талии. См."),
+    ("belly", "Обхват живота", "Измерьте обхват живота примерно на 8–10 см ниже талии. См."),
+    ("hips", "Обхват бёдер", "Измерьте наиболее выступающую часть бёдер. См."),
+    ("bust_height", "Высота груди", "Укажите расстояние от плечевой точки до центра груди по инструкции портного. См."),
+    ("bust_distance", "Расстояние между центрами груди", "Измерьте расстояние между центрами груди. См."),
+    ("back_waist", "Длина спины до талии", "Измерьте длину от основания шеи до линии талии по спине. См."),
+    ("front_waist", "Длина переда до талии", "Измерьте длину от плечевой точки через грудь до линии талии. См."),
+    ("back_width", "Ширина спины", "Измерьте ширину спины между задними точками подмышечных впадин. См."),
+    ("side_waist", "Расстояние от подмышки до талии", "Измерьте расстояние сбоку от подмышечной впадины до талии. См."),
+    ("corset_length", "Желаемая длина корсета спереди", "Укажите желаемую длину изделия по центру переда. См."),
+]
+
+class OrderFlow(StatesGroup):
+    consent = State()
+    model = State()
+    fabric = State()
+    measurements = State()
+    photos = State()
+    notes = State()
+
+class AddItemFlow(StatesGroup):
+    name = State()
+    description = State()
+    photo = State()
+
+class ProfileFlow(StatesGroup):
+    name = State()
+    phone = State()
+
+@asynccontextmanager
+async def connect_db():
+    Path(DB_PATH).parent.mkdir(parents=True, exist_ok=True)
+    db = await aiosqlite.connect(DB_PATH)
+    db.row_factory = aiosqlite.Row
+    try:
+        await db.execute("PRAGMA foreign_keys=ON")
+        yield db
+    finally:
+        await db.close()
+
+async def init_db():
+    async with connect_db() as db:
+        await db.executescript("""
+        CREATE TABLE IF NOT EXISTS users(
+            user_id INTEGER PRIMARY KEY, username TEXT, full_name TEXT NOT NULL,
+            role TEXT NOT NULL DEFAULT 'client', phone TEXT DEFAULT '',
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP
+        );
+        CREATE TABLE IF NOT EXISTS models(
+            id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL,
+            description TEXT DEFAULT '', photo_id TEXT DEFAULT '', active INTEGER DEFAULT 1
+        );
+        CREATE TABLE IF NOT EXISTS fabrics(
+            id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL,
+            description TEXT DEFAULT '', photo_id TEXT DEFAULT '', active INTEGER DEFAULT 1
+        );
+        CREATE TABLE IF NOT EXISTS orders(
+            id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL,
+            model_id INTEGER NOT NULL, fabric_id INTEGER NOT NULL,
+            status TEXT NOT NULL DEFAULT 'Новый', notes TEXT DEFAULT '',
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY(user_id) REFERENCES users(user_id),
+            FOREIGN KEY(model_id) REFERENCES models(id),
+            FOREIGN KEY(fabric_id) REFERENCES fabrics(id)
+        );
+        CREATE TABLE IF NOT EXISTS measurements(
+            order_id INTEGER PRIMARY KEY,
+            height REAL DEFAULT 0, bust REAL DEFAULT 0, underbust REAL DEFAULT 0,
+            waist REAL DEFAULT 0, belly REAL DEFAULT 0, hips REAL DEFAULT 0,
+            bust_height REAL DEFAULT 0, bust_distance REAL DEFAULT 0,
+            back_waist REAL DEFAULT 0, front_waist REAL DEFAULT 0,
+            back_width REAL DEFAULT 0, side_waist REAL DEFAULT 0,
+            corset_length REAL DEFAULT 0,
+            FOREIGN KEY(order_id) REFERENCES orders(id) ON DELETE CASCADE
+        );
+        CREATE TABLE IF NOT EXISTS order_photos(
+            id INTEGER PRIMARY KEY AUTOINCREMENT, order_id INTEGER NOT NULL,
+            file_id TEXT NOT NULL,
+            FOREIGN KEY(order_id) REFERENCES orders(id) ON DELETE CASCADE
+        );
+        CREATE TABLE IF NOT EXISTS ui_messages(
+            user_id INTEGER PRIMARY KEY, chat_id INTEGER NOT NULL, message_id INTEGER NOT NULL
+        );
+        """)
+        # Совместимость с базой прежней версии.
+        cols = {r["name"] for r in await (await db.execute("PRAGMA table_info(users)")).fetchall()}
+        if "phone" not in cols:
+            await db.execute("ALTER TABLE users ADD COLUMN phone TEXT DEFAULT ''")
+        mcols = {r["name"] for r in await (await db.execute("PRAGMA table_info(measurements)")).fetchall()}
+        for name in [x[0] for x in MEASUREMENTS]:
+            if name not in mcols:
+                await db.execute(f"ALTER TABLE measurements ADD COLUMN {name} REAL DEFAULT 0")
+        defaults = {
+            "models": [("Классический overbust", "Корсет с закрытием груди."), ("Классический underbust", "Корсет под грудью."), ("Удлинённый корсет", "Модель с удлинённой линией низа.")],
+            "fabrics": [("Атлас", "Гладкая ткань с лёгким блеском."), ("Хлопок", "Матовая ткань с натуральной фактурой."), ("Бархат", "Мягкая ткань с выразительной фактурой.")],
+        }
+        for table, items in defaults.items():
+            count = await (await db.execute(f"SELECT COUNT(*) n FROM {table}")).fetchone()
+            if count["n"] == 0:
+                await db.executemany(f"INSERT INTO {table}(name,description) VALUES(?,?)", items)
+        await db.commit()
+
+async def save_user(user):
+    role = "tailor" if ADMIN_ID and user.id == ADMIN_ID else "client"
+    async with connect_db() as db:
+        await db.execute("""INSERT INTO users(user_id,username,full_name,role) VALUES(?,?,?,?)
+        ON CONFLICT(user_id) DO UPDATE SET username=excluded.username,
+        full_name=excluded.full_name, role=excluded.role""", (user.id, user.username, user.full_name, role))
+        await db.commit()
+
+async def get_user(uid):
+    async with connect_db() as db:
+        row = await (await db.execute("SELECT * FROM users WHERE user_id=?", (uid,))).fetchone()
+        return dict(row) if row else None
+
+async def catalog(table):
+    if table not in ("models", "fabrics"):
+        raise ValueError("Unknown catalog")
+    async with connect_db() as db:
+        rows = await (await db.execute(f"SELECT id,name,description,photo_id FROM {table} WHERE active=1 ORDER BY id")).fetchall()
+        return [dict(r) for r in rows]
+
+async def add_catalog_item(table, name, description, photo_id):
+    async with connect_db() as db:
+        await db.execute(f"INSERT INTO {table}(name,description,photo_id) VALUES(?,?,?)", (name, description, photo_id))
+        await db.commit()
+
+async def create_order(uid, model_id, fabric_id, measures, photos, notes):
+    async with connect_db() as db:
+        cur = await db.execute("INSERT INTO orders(user_id,model_id,fabric_id,notes) VALUES(?,?,?,?)", (uid, model_id, fabric_id, notes))
+        oid = cur.lastrowid
+        measure_cols = [x[0] for x in MEASUREMENTS]
+        measure_values = list(measures)
+        existing_cols = {r["name"] for r in await (await db.execute("PRAGMA table_info(measurements)")).fetchall()}
+        # Старые версии базы содержали поля front/back с обязательным заполнением.
+        if "front" in existing_cols:
+            measure_cols.append("front")
+            measure_values.append(measures[9])
+        if "back" in existing_cols:
+            measure_cols.append("back")
+            measure_values.append(measures[8])
+        cols = ",".join(measure_cols)
+        marks = ",".join("?" for _ in measure_cols)
+        await db.execute(f"INSERT INTO measurements(order_id,{cols}) VALUES(?,{marks})", (oid, *measure_values))
+        if photos:
+            await db.executemany("INSERT INTO order_photos(order_id,file_id) VALUES(?,?)", [(oid, p) for p in photos])
+        await db.commit()
+        return oid
+
+async def get_order(oid):
+    async with connect_db() as db:
+        row = await (await db.execute("""SELECT o.*,u.user_id,u.full_name,u.username,u.phone,
+        m.name model_name,f.name fabric_name,x.* FROM orders o
+        JOIN users u ON u.user_id=o.user_id JOIN models m ON m.id=o.model_id
+        JOIN fabrics f ON f.id=o.fabric_id JOIN measurements x ON x.order_id=o.id
+        WHERE o.id=?""", (oid,))).fetchone()
+        if not row:
+            return None
+        data = dict(row)
+        photos = await (await db.execute("SELECT file_id FROM order_photos WHERE order_id=?", (oid,))).fetchall()
+        data["photos"] = [p["file_id"] for p in photos]
+        return data
+
+async def get_orders(uid=None, limit=30):
+    async with connect_db() as db:
+        if uid is None:
+            q = """SELECT o.id,o.status,o.created_at,u.full_name,m.name model_name
+            FROM orders o JOIN users u ON u.user_id=o.user_id JOIN models m ON m.id=o.model_id
+            ORDER BY o.id DESC LIMIT ?"""
+            args = (limit,)
+        else:
+            q = """SELECT o.id,o.status,o.created_at,m.name model_name FROM orders o
+            JOIN models m ON m.id=o.model_id WHERE o.user_id=? ORDER BY o.id DESC LIMIT ?"""
+            args = (uid, limit)
+        return [dict(r) for r in await (await db.execute(q, args)).fetchall()]
+
+async def update_status(oid, status):
+    async with connect_db() as db:
+        await db.execute("UPDATE orders SET status=? WHERE id=?", (status, oid))
+        await db.commit()
+
+async def update_profile(uid, field, value):
+    if field not in ("full_name", "phone"):
+        return
+    async with connect_db() as db:
+        await db.execute(f"UPDATE users SET {field}=? WHERE user_id=?", (value, uid))
+        await db.commit()
+
+async def delete_my_data(uid):
+    async with connect_db() as db:
+        await db.execute("DELETE FROM orders WHERE user_id=?", (uid,))
+        await db.execute("DELETE FROM users WHERE user_id=?", (uid,))
+        await db.execute("DELETE FROM ui_messages WHERE user_id=?", (uid,))
+        await db.commit()
+
+async def remember_ui(uid, chat_id, message_id):
+    async with connect_db() as db:
+        await db.execute("""INSERT INTO ui_messages(user_id,chat_id,message_id) VALUES(?,?,?)
+        ON CONFLICT(user_id) DO UPDATE SET chat_id=excluded.chat_id,message_id=excluded.message_id""", (uid, chat_id, message_id))
+        await db.commit()
+
+async def get_ui(uid):
+    async with connect_db() as db:
+        r = await (await db.execute("SELECT chat_id,message_id FROM ui_messages WHERE user_id=?", (uid,))).fetchone()
+        return dict(r) if r else None
+
+async def show_screen(bot, uid, chat_id, text, markup=None):
+    old = await get_ui(uid)
+    if old and old["chat_id"] == chat_id:
+        try:
+            await bot.edit_message_text(text, chat_id=chat_id, message_id=old["message_id"], reply_markup=markup)
+            return old["message_id"]
+        except Exception:
+            pass
+    sent = await bot.send_message(chat_id, text, reply_markup=markup)
+    await remember_ui(uid, chat_id, sent.message_id)
+    return sent.message_id
+
+async def delete_user_message(message: Message):
+    try:
+        await message.delete()
+    except Exception:
+        pass
+
+def esc(v):
+    return html.escape(str(v or ""))
+
+def is_admin(uid):
+    return bool(ADMIN_ID and uid == ADMIN_ID)
+
+def client_menu():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="👗 Заказать корсет", callback_data="client:new")],
+        [InlineKeyboardButton(text="📦 Мои заказы", callback_data="client:orders"), InlineKeyboardButton(text="📏 Мои мерки", callback_data="client:measures")],
+        [InlineKeyboardButton(text="👤 Мой профиль", callback_data="client:profile")],
+        [InlineKeyboardButton(text="🗑 Удалить мои данные", callback_data="client:delete")],
+        [InlineKeyboardButton(text="🧵 Каталог моделей", callback_data="catalog:models"), InlineKeyboardButton(text="🎨 Каталог тканей", callback_data="catalog:fabrics")],
+        [InlineKeyboardButton(text="ℹ️ О проекте", callback_data="client:about")],
+    ])
+
+def tailor_menu():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📥 Все заказы", callback_data="tailor:orders")],
+        [InlineKeyboardButton(text="👗 Каталог моделей", callback_data="catalog:models")],
+        [InlineKeyboardButton(text="🧵 Управление моделями", callback_data="tailor:add:model")],
+        [InlineKeyboardButton(text="🎨 Управление тканями", callback_data="tailor:add:fabric")],
+        [InlineKeyboardButton(text="↩️ Главное меню", callback_data="home")],
+    ])
+
+def back_menu():
+    return InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="↩️ В меню", callback_data="home")]])
+
+def choose_keyboard(items, prefix):
+    rows = [[InlineKeyboardButton(text=x["name"][:60], callback_data=f"{prefix}:{x['id']}")] for x in items]
+    rows.append([InlineKeyboardButton(text="↩️ Назад", callback_data="home")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+def status_menu(oid):
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🧵 Принять в работу", callback_data=f"status:{oid}:В работе")],
+        [InlineKeyboardButton(text="📐 Лекала подготовлены", callback_data=f"status:{oid}:Лекала готовы")],
+        [InlineKeyboardButton(text="✂️ Пошив", callback_data=f"status:{oid}:Пошив")],
+        [InlineKeyboardButton(text="✅ Заказ завершён", callback_data=f"status:{oid}:Завершён")],
+        [InlineKeyboardButton(text="↩️ К заказам", callback_data="tailor:orders")],
+    ])
+
+def parse_measure(value):
+    try:
+        n = float(value.replace(",", ".").strip())
+        return n if 1 <= n <= 250 else None
+    except (ValueError, AttributeError):
+        return None
+
+async def render_home(bot, uid, chat_id):
+    if is_admin(uid):
+        return await show_screen(bot, uid, chat_id, "🧵 <b>Панель портного</b>\n\nУправляйте заказами, каталогом моделей и тканей.", tailor_menu())
+    user = await get_user(uid)
+    name = esc(user["full_name"] if user else "Клиент")
+    orders = await get_orders(uid, 1)
+    last = f"\nПоследний заказ: <b>#{orders[0]['id']} · {esc(orders[0]['status'])}</b>" if orders else "\nУ вас пока нет заказов."
+    return await show_screen(bot, uid, chat_id, f"🧵 <b>CORSET</b>\n\nЗдравствуйте, {name}!\nИндивидуальный пошив корсетов — от выбора модели до готового изделия.{last}\n\nВыберите нужный раздел:", client_menu())
+
+async def send_order_to_tailor(bot, oid):
+    if not ADMIN_ID:
+        log.warning("ADMIN_ID не задан; уведомление не отправлено")
+        return
+    order = await get_order(oid)
+    if not order:
+        return
+    lines = [f"🆕 <b>Заказ #{oid}</b>", f"Клиент: {esc(order['full_name'])}", f"Контакт: @{esc(order['username']) if order['username'] else 'не указан'}", f"Телефон: {esc(order['phone']) or 'не указан'}", f"Модель: {esc(order['model_name'])}", f"Ткань: {esc(order['fabric_name'])}", "", "<b>Мерки, см:</b>"]
+    for key, label, _ in MEASUREMENTS:
+        lines.append(f"{label}: {order.get(key, 0)}")
+    lines.extend(["", f"Пожелания: {esc(order['notes']) or 'нет'}"])
+    await bot.send_message(ADMIN_ID, "\n".join(lines), reply_markup=status_menu(oid))
+    if order["photos"]:
+        media = [InputMediaPhoto(media=p, caption=f"Фото к заказу #{oid}" if i == 0 else None) for i, p in enumerate(order["photos"][:10])]
+        try:
+            await bot.send_media_group(ADMIN_ID, media)
+        except Exception:
+            for i, p in enumerate(order["photos"]):
+                try:
+                    await bot.send_photo(ADMIN_ID, p, caption=f"Фото {i+1}, заказ #{oid}")
+                except Exception:
+                    log.exception("Не удалось отправить фото заказа")
+
+@router.message(CommandStart())
+async def start(message: Message, state: FSMContext, bot: Bot):
+    await state.clear()
+    await save_user(message.from_user)
+    await delete_user_message(message)
+    await render_home(bot, message.from_user.id, message.chat.id)
+
+@router.message(Command("myid"))
+async def myid(message: Message):
+    await message.answer(f"Ваш Telegram ID: <code>{message.from_user.id}</code>")
+
+@router.message(Command("cancel"))
+async def cancel(message: Message, state: FSMContext, bot: Bot):
+    await state.clear()
+    await delete_user_message(message)
+    await render_home(bot, message.from_user.id, message.chat.id)
+
+@router.callback_query(F.data == "home")
+async def home(call: CallbackQuery, state: FSMContext, bot: Bot):
+    await state.clear()
+    await render_home(bot, call.from_user.id, call.message.chat.id)
+    await call.answer()
+
+@router.callback_query(F.data == "client:about")
+async def about(call: CallbackQuery, bot: Bot):
+    await show_screen(bot, call.from_user.id, call.message.chat.id,
+        "🧵 <b>О проекте CORSET</b>\n\nСервис индивидуального пошива корсетов. Вы выбираете модель и ткань, заполняете мерки и отправляете фотографии. Портной проверяет данные и связывается с вами по заказу.", back_menu())
+    await call.answer()
+
+@router.callback_query(F.data == "client:new")
+async def begin_order(call: CallbackQuery, state: FSMContext, bot: Bot):
+    await state.clear()
+    await state.set_state(OrderFlow.consent)
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✅ Продолжить", callback_data="consent:yes")],
+        [InlineKeyboardButton(text="Отмена", callback_data="home")],
+    ])
+    await show_screen(bot, call.from_user.id, call.message.chat.id,
+        "Перед оформлением заказа подтвердите, что согласны передать портному свои мерки и фотографии для подготовки индивидуального изделия.\n\nОтправляйте только те фотографии, которыми готовы поделиться. Ознакомьтесь с политикой обработки персональных данных владельца сервиса.", kb)
+    await call.answer()
+
+@router.callback_query(F.data == "consent:yes", OrderFlow.consent)
+async def consent_yes(call: CallbackQuery, state: FSMContext, bot: Bot):
+    items = await catalog("models")
+    if not items:
+        await state.clear()
+        await show_screen(bot, call.from_user.id, call.message.chat.id, "Каталог моделей пока пуст.", back_menu())
+    else:
+        await state.set_state(OrderFlow.model)
+        await show_screen(bot, call.from_user.id, call.message.chat.id, "<b>Шаг 1 из 2.</b> Выберите модель корсета:", choose_keyboard(items, "model"))
+    await call.answer()
+
+@router.callback_query(F.data.startswith("model:"), OrderFlow.model)
+async def choose_model(call: CallbackQuery, state: FSMContext, bot: Bot):
+    try:
+        mid = int(call.data.split(":", 1)[1])
+    except ValueError:
+        return await call.answer("Некорректный выбор", show_alert=True)
+    await state.update_data(model_id=mid)
+    items = await catalog("fabrics")
+    if not items:
+        await state.clear()
+        await show_screen(bot, call.from_user.id, call.message.chat.id, "Каталог тканей пока пуст.", back_menu())
+    else:
+        await state.set_state(OrderFlow.fabric)
+        await show_screen(bot, call.from_user.id, call.message.chat.id, "<b>Шаг 2 из 2.</b> Выберите ткань:", choose_keyboard(items, "fabric"))
+    await call.answer()
+
+@router.callback_query(F.data.startswith("fabric:"), OrderFlow.fabric)
+async def choose_fabric(call: CallbackQuery, state: FSMContext, bot: Bot):
+    try:
+        fid = int(call.data.split(":", 1)[1])
+    except ValueError:
+        return await call.answer("Некорректный выбор", show_alert=True)
+    await state.update_data(fabric_id=fid, measures=[], measure_index=0, photos=[])
+    await state.set_state(OrderFlow.measurements)
+    await show_screen(bot, call.from_user.id, call.message.chat.id,
+        "📏 <b>Снятие мерок · 1 из 13</b>\n\n" + MEASUREMENTS[0][2] + "\n\nВводите значение числом. Для отмены: /cancel")
+    await call.answer()
+
+@router.message(OrderFlow.measurements)
+async def measurement_input(message: Message, state: FSMContext, bot: Bot):
+    value = parse_measure(message.text)
+    await delete_user_message(message)
+    if value is None:
+        return await show_screen(bot, message.from_user.id, message.chat.id, "Введите значение от 1 до 250 см числом. Попробуйте ещё раз.")
+    data = await state.get_data()
+    idx = int(data.get("measure_index", 0))
+    measures = list(data.get("measures", []))
+    if idx >= len(MEASUREMENTS):
+        await state.clear()
+        return await render_home(bot, message.from_user.id, message.chat.id)
+    measures.append(value)
+    idx += 1
+    await state.update_data(measures=measures, measure_index=idx)
+    if idx < len(MEASUREMENTS):
+        _, label, prompt = MEASUREMENTS[idx]
+        text = f"📏 <b>Снятие мерок · {idx+1} из {len(MEASUREMENTS)}</b>\n\n<b>{esc(label)}</b>\n{esc(prompt)}\n\nВведите значение в сантиметрах."
+        await show_screen(bot, message.from_user.id, message.chat.id, text)
+    else:
+        await state.set_state(OrderFlow.photos)
+        kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="Пропустить фотографии", callback_data="photos:skip")], [InlineKeyboardButton(text="Отмена", callback_data="home")]])
+        await show_screen(bot, message.from_user.id, message.chat.id,
+            "✅ Все 13 мерок заполнены.\n\n📸 Теперь отправьте до 5 фотографий: спереди, сбоку и при необходимости сзади. Фото нужны портному для оценки посадки и особенностей фигуры. Можно пропустить этот шаг.", kb)
+
+@router.message(OrderFlow.photos, F.photo)
+async def collect_photo(message: Message, state: FSMContext, bot: Bot):
+    data = await state.get_data()
+    photos = list(data.get("photos", []))
+    if len(photos) >= 5:
+        await delete_user_message(message)
+        return await show_screen(bot, message.from_user.id, message.chat.id, "Достигнут лимит — 5 фотографий. Нажмите «Завершить загрузку» или продолжите без новых фото.", photos_keyboard())
+    photos.append(message.photo[-1].file_id)
+    await state.update_data(photos=photos)
+    await delete_user_message(message)
+    await show_screen(bot, message.from_user.id, message.chat.id, f"📸 Фото добавлено: {len(photos)}/5.\n\nОтправьте ещё фото или нажмите «Завершить загрузку».", photos_keyboard())
+
+def photos_keyboard():
+    return InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="Готово, продолжить", callback_data="photos:done")], [InlineKeyboardButton(text="Пропустить", callback_data="photos:skip")], [InlineKeyboardButton(text="Отмена", callback_data="home")]])
+
+@router.callback_query(F.data.in_({"photos:done", "photos:skip"}), OrderFlow.photos)
+async def photos_done(call: CallbackQuery, state: FSMContext, bot: Bot):
+    await state.set_state(OrderFlow.notes)
+    await show_screen(bot, call.from_user.id, call.message.chat.id,
+        "✍️ Напишите пожелания к заказу: особенности модели, посадки, декора или другие детали.\n\nЕсли пожеланий нет, отправьте дефис «-».")
+    await call.answer()
+
+@router.message(OrderFlow.photos)
+async def photos_other(message: Message, bot: Bot):
+    await delete_user_message(message)
+    await show_screen(bot, message.from_user.id, message.chat.id, "Пожалуйста, отправьте фотографию или воспользуйтесь кнопками на экране.", photos_keyboard())
+
+@router.message(OrderFlow.notes)
+async def complete_order(message: Message, state: FSMContext, bot: Bot):
+    if not message.text:
+        await delete_user_message(message)
+        return await show_screen(bot, message.from_user.id, message.chat.id, "Напишите пожелания текстом или отправьте «-».")
+    data = await state.get_data()
+    if len(data.get("measures", [])) != len(MEASUREMENTS) or not all(k in data for k in ("model_id", "fabric_id")):
+        await state.clear()
+        await delete_user_message(message)
+        return await render_home(bot, message.from_user.id, message.chat.id)
+    notes = "" if message.text.strip() == "-" else message.text.strip()[:1500]
+    oid = await create_order(message.from_user.id, data["model_id"], data["fabric_id"], data["measures"], data.get("photos", []), notes)
+    await state.clear()
+    await delete_user_message(message)
+    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="📦 Открыть мои заказы", callback_data="client:orders")], [InlineKeyboardButton(text="🏠 Главное меню", callback_data="home")]])
+    await show_screen(bot, message.from_user.id, message.chat.id, f"✅ <b>Заказ #{oid} оформлен!</b>\n\nДанные переданы портному. Вы сможете следить за изменением статуса в разделе «Мои заказы».", kb)
+    await send_order_to_tailor(bot, oid)
+
+@router.callback_query(F.data == "client:orders")
+async def client_orders(call: CallbackQuery, bot: Bot):
+    rows = await get_orders(call.from_user.id)
+    if not rows:
+        text = "📦 <b>Мои заказы</b>\n\nЗаказов пока нет."
+        kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="👗 Оформить заказ", callback_data="client:new")], [InlineKeyboardButton(text="↩️ В меню", callback_data="home")]])
+    else:
+        lines = ["📦 <b>Мои заказы</b>"]
+        buttons = []
+        for r in rows:
+            lines.append(f"\n<b>#{r['id']}</b> · {esc(r['model_name'])}\nСтатус: {esc(r['status'])}\nДата: {esc(r['created_at'])}")
+            buttons.append([InlineKeyboardButton(text=f"Подробнее · заказ #{r['id']}", callback_data=f"order:view:{r['id']}")])
+        buttons.append([InlineKeyboardButton(text="↩️ В меню", callback_data="home")])
+        text, kb = "".join(lines), InlineKeyboardMarkup(inline_keyboard=buttons)
+    await show_screen(bot, call.from_user.id, call.message.chat.id, text, kb)
+    await call.answer()
+
+@router.callback_query(F.data.startswith("order:view:"))
+async def order_view(call: CallbackQuery, bot: Bot):
+    try:
+        oid = int(call.data.rsplit(":", 1)[1])
+    except ValueError:
+        return await call.answer("Некорректный номер", show_alert=True)
+    order = await get_order(oid)
+    if not order or (order["user_id"] != call.from_user.id and not is_admin(call.from_user.id)):
+        return await call.answer("Заказ не найден", show_alert=True)
+    text = f"📦 <b>Заказ #{oid}</b>\nМодель: {esc(order['model_name'])}\nТкань: {esc(order['fabric_name'])}\nСтатус: <b>{esc(order['status'])}</b>\nСоздан: {esc(order['created_at'])}\nФотографий: {len(order['photos'])}\nПожелания: {esc(order['notes']) or 'нет'}"
+    await show_screen(bot, call.from_user.id, call.message.chat.id, text, back_menu())
+    await call.answer()
+
+@router.callback_query(F.data == "client:profile")
+async def client_profile(call: CallbackQuery, bot: Bot):
+    user = await get_user(call.from_user.id)
+    orders = await get_orders(call.from_user.id)
+    text = (f"👤 <b>Мой профиль</b>\n\nИмя: {esc(user['full_name'] if user else call.from_user.full_name)}\n"
+            f"Username: @{esc(user['username']) if user and user['username'] else 'не указан'}\n"
+            f"Телефон: {esc(user['phone']) if user and user['phone'] else 'не указан'}\n"
+            f"Telegram ID: <code>{call.from_user.id}</code>\nЗаказов: {len(orders)}")
+    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="Изменить имя", callback_data="profile:name")], [InlineKeyboardButton(text="Добавить телефон", callback_data="profile:phone")], [InlineKeyboardButton(text="↩️ В меню", callback_data="home")]])
+    await show_screen(bot, call.from_user.id, call.message.chat.id, text, kb)
+    await call.answer()
+
+@router.callback_query(F.data == "profile:name")
+async def profile_name_start(call: CallbackQuery, state: FSMContext, bot: Bot):
+    await state.set_state(ProfileFlow.name)
+    await show_screen(bot, call.from_user.id, call.message.chat.id, "Введите имя, которое будет отображаться в профиле.", back_menu())
+    await call.answer()
+
+@router.callback_query(F.data == "profile:phone")
+async def profile_phone_start(call: CallbackQuery, state: FSMContext, bot: Bot):
+    await state.set_state(ProfileFlow.phone)
+    await show_screen(bot, call.from_user.id, call.message.chat.id, "Введите номер телефона в международном формате. Например: +7 900 000 00 00", back_menu())
+    await call.answer()
+
+@router.message(ProfileFlow.name)
+async def profile_name_save(message: Message, state: FSMContext, bot: Bot):
+    value = (message.text or "").strip()
+    await delete_user_message(message)
+    if not 2 <= len(value) <= 80:
+        return await show_screen(bot, message.from_user.id, message.chat.id, "Имя должно содержать от 2 до 80 символов. Попробуйте ещё раз.")
+    await update_profile(message.from_user.id, "full_name", value)
+    await state.clear()
+    await show_screen(bot, message.from_user.id, message.chat.id, "✅ Имя профиля обновлено.", back_menu())
+
+@router.message(ProfileFlow.phone)
+async def profile_phone_save(message: Message, state: FSMContext, bot: Bot):
+    value = (message.text or "").strip()
+    await delete_user_message(message)
+    digits = "".join(ch for ch in value if ch.isdigit())
+    if not 7 <= len(digits) <= 15:
+        return await show_screen(bot, message.from_user.id, message.chat.id, "Проверьте номер: укажите от 7 до 15 цифр, можно с + и пробелами.")
+    await update_profile(message.from_user.id, "phone", value[:30])
+    await state.clear()
+    await show_screen(bot, message.from_user.id, message.chat.id, "✅ Номер телефона сохранён.", back_menu())
+
+@router.callback_query(F.data == "client:measures")
+async def client_measures(call: CallbackQuery, bot: Bot):
+    async with connect_db() as db:
+        row = await (await db.execute("""SELECT x.* FROM measurements x JOIN orders o ON o.id=x.order_id
+        WHERE o.user_id=? ORDER BY o.id DESC LIMIT 1""", (call.from_user.id,))).fetchone()
+    if not row:
+        text = "📏 <b>Мои мерки</b>\n\nСохранённых мерок пока нет. Они появятся после оформления первого заказа."
+    else:
+        text = "📏 <b>Мои мерки из последнего заказа</b>\n\n" + "\n".join(f"{esc(label)}: {row[key]} см" for key, label, _ in MEASUREMENTS)
+        text += "\n\nПеред новым заказом проверьте актуальность значений."
+    await show_screen(bot, call.from_user.id, call.message.chat.id, text, back_menu())
+    await call.answer()
+
+@router.callback_query(F.data.startswith("catalog:"))
+async def show_catalog(call: CallbackQuery, bot: Bot):
+    table = call.data.split(":", 1)[1]
+    if table not in ("models", "fabrics"):
+        return await call.answer("Раздел не найден", show_alert=True)
+    items = await catalog(table)
+    if not items:
+        return await call.answer("Каталог пока пуст", show_alert=True)
+    lines = ["👗 <b>Каталог моделей</b>" if table == "models" else "🎨 <b>Каталог тканей</b>"]
+    for item in items:
+        lines.append(f"\n<b>{esc(item['name'])}</b>\n{esc(item['description']) or 'Описание скоро появится.'}")
+    await show_screen(bot, call.from_user.id, call.message.chat.id, "\n".join(lines), back_menu())
+    await call.answer()
+
+@router.callback_query(F.data == "tailor:orders")
+async def tailor_orders(call: CallbackQuery, bot: Bot):
+    if not is_admin(call.from_user.id):
+        return await call.answer("Доступ запрещён", show_alert=True)
+    rows = await get_orders()
+    if not rows:
+        await show_screen(bot, call.from_user.id, call.message.chat.id, "📥 <b>Заказы</b>\n\nНовых заказов пока нет.", tailor_menu())
+    else:
+        lines = ["📥 <b>Последние заказы</b>"]
+        buttons = []
+        for r in rows:
+            lines.append(f"\n<b>#{r['id']}</b> · {esc(r['model_name'])}\nКлиент: {esc(r['full_name'])}\nСтатус: {esc(r['status'])}")
+            buttons.append([InlineKeyboardButton(text=f"Открыть заказ #{r['id']}", callback_data=f"tailor:view:{r['id']}")])
+        buttons.append([InlineKeyboardButton(text="↩️ В панель", callback_data="home")])
+        await show_screen(bot, call.from_user.id, call.message.chat.id, "\n".join(lines), InlineKeyboardMarkup(inline_keyboard=buttons))
+    await call.answer()
+
+@router.callback_query(F.data.startswith("tailor:view:"))
+async def tailor_view(call: CallbackQuery, bot: Bot):
+    if not is_admin(call.from_user.id):
+        return await call.answer("Доступ запрещён", show_alert=True)
+    try:
+        oid = int(call.data.rsplit(":", 1)[1])
+    except ValueError:
+        return await call.answer("Некорректный номер", show_alert=True)
+    order = await get_order(oid)
+    if not order:
+        return await call.answer("Заказ не найден", show_alert=True)
+    lines = [f"📋 <b>Заказ #{oid}</b>", f"Клиент: {esc(order['full_name'])}", f"Username: @{esc(order['username']) if order['username'] else 'не указан'}", f"Телефон: {esc(order['phone']) or 'не указан'}", f"Модель: {esc(order['model_name'])}", f"Ткань: {esc(order['fabric_name'])}", f"Статус: {esc(order['status'])}", "", "<b>Мерки, см:</b>"]
+    lines.extend(f"{esc(label)}: {order.get(key, 0)}" for key, label, _ in MEASUREMENTS)
+    lines.extend(["", f"Пожелания: {esc(order['notes']) or 'нет'}", f"Фотографий: {len(order['photos'])}"])
+    await show_screen(bot, call.from_user.id, call.message.chat.id, "\n".join(lines), status_menu(oid))
+    if order["photos"]:
+        try:
+            await bot.send_media_group(call.message.chat.id, [InputMediaPhoto(media=p, caption=f"Фото заказа #{oid}" if i == 0 else None) for i, p in enumerate(order["photos"][:10])])
+        except Exception:
+            pass
+    await call.answer()
+
+@router.callback_query(F.data.startswith("tailor:add:"))
+async def add_item_begin(call: CallbackQuery, state: FSMContext, bot: Bot):
+    if not is_admin(call.from_user.id):
+        return await call.answer("Доступ запрещён", show_alert=True)
+    kind = call.data.rsplit(":", 1)[1]
+    if kind not in ("model", "fabric"):
+        return await call.answer("Раздел не найден", show_alert=True)
+    await state.clear()
+    await state.update_data(table="models" if kind == "model" else "fabrics")
+    await state.set_state(AddItemFlow.name)
+    await show_screen(bot, call.from_user.id, call.message.chat.id, "Введите название новой позиции.", back_menu())
+    await call.answer()
+
+@router.message(AddItemFlow.name)
+async def add_item_name(message: Message, state: FSMContext, bot: Bot):
+    if not is_admin(message.from_user.id):
+        await state.clear(); return
+    name = (message.text or "").strip()
+    await delete_user_message(message)
+    if not 1 <= len(name) <= 100:
+        return await show_screen(bot, message.from_user.id, message.chat.id, "Название должно содержать от 1 до 100 символов.")
+    await state.update_data(item_name=name)
+    await state.set_state(AddItemFlow.description)
+    await show_screen(bot, message.from_user.id, message.chat.id, "Введите описание или отправьте дефис «-», если его нет.")
+
+@router.message(AddItemFlow.description)
+async def add_item_description(message: Message, state: FSMContext, bot: Bot):
+    if not is_admin(message.from_user.id):
+        await state.clear(); return
+    desc = (message.text or "").strip()
+    await delete_user_message(message)
+    if len(desc) > 500:
+        return await show_screen(bot, message.from_user.id, message.chat.id, "Описание не должно превышать 500 символов.")
+    await state.update_data(item_description="" if desc == "-" else desc)
+    await state.set_state(AddItemFlow.photo)
+    await show_screen(bot, message.from_user.id, message.chat.id, "Отправьте фотографию позиции или дефис «-» без фотографии.")
+
+@router.message(AddItemFlow.photo)
+async def add_item_finish(message: Message, state: FSMContext, bot: Bot):
+    if not is_admin(message.from_user.id):
+        await state.clear(); return
+    photo_id = message.photo[-1].file_id if message.photo else ""
+    await delete_user_message(message)
+    if not photo_id and (message.text or "").strip() != "-":
+        return await show_screen(bot, message.from_user.id, message.chat.id, "Отправьте фото или дефис «-».")
+    data = await state.get_data()
+    await add_catalog_item(data["table"], data["item_name"], data["item_description"], photo_id)
+    await state.clear()
+    await show_screen(bot, message.from_user.id, message.chat.id, "✅ Позиция добавлена в каталог.", tailor_menu())
+
+@router.callback_query(F.data.startswith("status:"))
+async def change_status(call: CallbackQuery, bot: Bot):
+    if not is_admin(call.from_user.id):
+        return await call.answer("Доступ запрещён", show_alert=True)
+    try:
+        _, raw_id, status = call.data.split(":", 2)
+        oid = int(raw_id)
+    except ValueError:
+        return await call.answer("Некорректные данные", show_alert=True)
+    allowed = {"В работе", "Лекала готовы", "Пошив", "Завершён"}
+    if status not in allowed:
+        return await call.answer("Недопустимый статус", show_alert=True)
+    order = await get_order(oid)
+    if not order:
+        return await call.answer("Заказ не найден", show_alert=True)
+    await update_status(oid, status)
+    text = f"📦 Статус вашего заказа <b>#{oid}</b> обновлён: <b>{esc(status)}</b>."
+    markup = None
+    if status == "Завершён" and FEEDBACK_URL:
+        markup = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⭐ Оставить отзыв", url=FEEDBACK_URL)]])
+    try:
+        await show_screen(bot, order["user_id"], order["user_id"], text, markup)
+    except Exception:
+        try:
+            await bot.send_message(order["user_id"], text, reply_markup=markup)
+        except Exception:
+            log.exception("Не удалось уведомить клиента о смене статуса")
+    await show_screen(bot, call.from_user.id, call.message.chat.id, f"✅ Статус заказа #{oid} изменён: <b>{esc(status)}</b>.", status_menu(oid))
+    await call.answer("Статус обновлён")
+
+@router.callback_query(F.data == "client:delete")
+async def delete_prompt(call: CallbackQuery, bot: Bot):
+    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="Да, удалить данные", callback_data="delete:yes")], [InlineKeyboardButton(text="Отмена", callback_data="home")]])
+    await show_screen(bot, call.from_user.id, call.message.chat.id, "Удалить профиль, заказы, мерки и сохранённые ссылки на фотографии? Действие необратимо. Сообщения и фотографии, уже отправленные портному, могут потребовать отдельного удаления.", kb)
+    await call.answer()
+
+@router.callback_query(F.data == "delete:yes")
+async def delete_yes(call: CallbackQuery, bot: Bot, state: FSMContext):
+    await delete_my_data(call.from_user.id)
+    await state.clear()
+    await save_user(call.from_user)
+    await show_screen(bot, call.from_user.id, call.message.chat.id, "Данные профиля и заказы удалены из базы бота. Профиль создан заново.", back_menu())
+    await call.answer()
+
+@router.message()
+async def fallback(message: Message, bot: Bot):
+    await delete_user_message(message)
+    await render_home(bot, message.from_user.id, message.chat.id)
+
+async def main():
+    if not BOT_TOKEN:
+        raise RuntimeError("Не задан BOT_TOKEN. Укажите его в .env или переменных окружения хостинга.")
+    await init_db()
+    bot = Bot(BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
+    dp = Dispatcher(storage=MemoryStorage())
+    dp.include_router(router)
+    log.info("CORSET запущен")
+    try:
+        await dp.start_polling(bot)
+    finally:
+        await bot.session.close()
+
+if __name__ == "__main__":
+    asyncio.run(main())
